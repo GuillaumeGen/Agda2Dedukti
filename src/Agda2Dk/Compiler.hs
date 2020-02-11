@@ -234,14 +234,14 @@ extractRules eta n (Function {funCovering=f}) ty =
   do
     l <- mapM (clause2rule eta n) f
     return $ catMaybes l
-extractRules eta n (Datatype {dataCons=cons, dataClause=Just c, dataPars=i, dataIxs=j}) ty=
+extractRules eta n (Datatype {dataClause=Just c, dataPars=i, dataIxs=j}) ty=
   do
-    l <- sequence [clause2rule eta n c, Just <$> decodedVersion eta n (i+j)]
-    (catMaybes l ++) <$> (etaIsId eta n i j cons)
-extractRules eta n (Datatype {dataCons=cons, dataClause=Nothing, dataPars=i, dataIxs=j}) ty =
+    l <- sequence [clause2rule eta n c, Just <$> decodedVersion eta n (i+j), Just <$> etaIsId eta n (i+j)]
+    return $ catMaybes l
+extractRules eta n (Datatype {dataClause=Nothing, dataPars=i, dataIxs=j}) ty =
   do
-    l <- sequence [Just <$> decodedVersion eta n (i+j)]
-    (catMaybes l ++) <$> (etaIsId eta n i j cons)
+    l <- sequence [Just <$> decodedVersion eta n (i+j), Just <$> etaIsId eta n (i+j)]
+    return $ catMaybes l
 extractRules eta n (Record {recClause=Just c, recPars=i, recConHead=hd, recFields=f}) ty =
   do
     l <- sequence [clause2rule eta n c, Just <$> decodedVersion eta n i, Just <$> etaExpansionDecl eta n i hd f]
@@ -802,48 +802,19 @@ etaExpandType eta (El s u) = do
   uu <- checkInternal' (etaExpandAction eta) u (sort s)
   return $ El s uu
 
-etaIsId :: DkModuleEnv -> QName -> Nat -> Nat -> [QName] -> TCM [DkRule]
-etaIsId eta n i j cons = do
+etaIsId :: DkModuleEnv -> QName -> Nat -> TCM DkRule
+etaIsId eta n i = do
   reportSDoc "toDk.eta" 5 $ (text "  Eta is id of" <+>) <$> AP.prettyTCM n
-  mapM oneCase cons
-
+  Right nn <- qName2DkName eta n
+  return $ DkRule
+    { decoding  = False
+    , context   = ["x"]
+    , headsymb  = hd
+    , patts     = [DkJoker, DkFun nn (replicate i DkJoker), DkVar "x" 0 []]
+    , rhs       = DkDB "x" 0
+    }
   where
     hd = DkQualified ["Agda"] [] "etaExpand"
-    oneCase f = do
-      Defn{defType=tt} <- getConstInfo f
-      TelV tele _ <- telView tt
-      addContext tele $
-        modifyContext separateVars $ do
-        -- We do have the information that n is not a copy,
-        -- otherwise it would not have gone through compileDef
-        Right cc <- qName2DkName eta f
-        Right nn <- qName2DkName eta n
-        ctx <- getContext
-        context <- extractContext ctx
-        consArg <- pattCons cc ctx
-        rhs <- constructRhsFields 0 (DkConst cc) ctx
-        return $ DkRule
-          { decoding  = False
-          , context   = context
-          , headsymb  = hd
-          , patts     = [DkJoker, DkFun nn (replicate (i+j) DkJoker), consArg]
-          , rhs       = rhs
-          }
-
-    pattCons cc args =
-      DkFun cc <$> nextIndex [] 0 args
-    nextIndex acc j []     = return acc
-    nextIndex acc j (_:tl) = do
-      (vj,_) <- extractPattern eta [] 0 (defaultArg $ unnamed $ varP (DBPatVar "_" j)) __DUMMY_TYPE__ Set.empty
-      nextIndex (vj:acc) (j+1) tl
-
-    constructRhsFields _ t [] = return t
-    constructRhsFields j t (Dom{unDom=(_,tt)}:tl) = do
-      let ttGoodDB = raise (j+1) tt
-      vEta <- checkInternal' (etaExpandAction eta) (Var j []) ttGoodDB
-      vParam <- reconstructParameters' (etaExpandAction eta) ttGoodDB vEta
-      dkArg <- translateTerm eta vParam
-      (`DkApp` dkArg) <$> constructRhsFields (j+1) t tl
 
 etaExpansionDecl :: QName -> QName -> Int -> ConHead -> [Arg QName] -> TCM DkRule
 etaExpansionDecl eta n nbPars ConHead{conName = cons} l = do
@@ -960,7 +931,10 @@ etaExpansion eta t u = do
   case unEl t of
     Var _ _   -> etaExp t u
     Def n _   -> do
-      ifM (isLevel n) (return u) (etaExp t u)
+      isData <- isDataOrRecordType n
+      if isData == Just IsData
+      then return u
+      else ifM (isLevel n) (return u) (etaExp t u)
     Pi (a@Dom{domInfo=info}) b -> do
       reportSDoc "toDk.eta" 40 $ (text "    In the product" <+>) <$> AP.prettyTCM t
       ctx <- getContext
@@ -998,59 +972,59 @@ etaExpansion eta t u = do
     isLevel qn@QName{qnameModule=mods, qnameName=nam} =
       return $ (map name2DkIdent (mnameToList mods)) == ["Agda", "Primitive"] && (name2DkIdent nam) == "Level"
 
-removeEtaOnProj :: DkModuleEnv -> QName -> Nat -> Term -> TCM Term
-removeEtaOnProj eta recN 0 (Var i l)                   =
-  Var i <$> mapM (removeEtaOnProjApp eta recN) l
-removeEtaOnProj eta recN 0 (Lam info (Abs i t))        =
-  Lam info <$> (Abs i <$> (removeEtaOnProj eta recN 0 t))
-removeEtaOnProj eta recN 0 (Def n l)                   = do
-  proj <- isProjection n
-  if Just recN == (projProper =<< proj)
-  then
-    Def n <$> mapM (removeEtaApp eta) l
-  else
-    Def n <$> mapM (removeEtaOnProjApp eta recN) l
-removeEtaOnProj eta recN 0 (Con hd info l)             =
-  Con hd info <$> mapM (removeEtaOnProjApp eta recN) l
-removeEtaOnProj eta recN 0 (Pi a@Dom{unDom=El sa u} b) = do
-  dom <- removeEtaOnProj eta recN 0 u
-  codom <- removeEtaOnProj eta recN 0 (unEl (unAbs b))
-  return $ Pi a{unDom=El sa dom} b{unAbs=El (_getSort (unAbs b)) codom}
-removeEtaOnProj eta recN 0 (Lit l)                     =
-  return $ Lit l
-removeEtaOnProj eta recN 0 (Level l)                   =
-  return $ Level l
-removeEtaOnProj eta recN 0 (Sort s)                    =
-  return $ Sort s
-removeEtaOnProj eta recN j (Pi a b)                    = do
-  codom <- removeEtaOnProj eta recN (j-1) (unEl (unAbs b))
-  return $ Pi a b{unAbs=El (_getSort (unAbs b)) codom}
+-- removeEtaOnProj :: DkModuleEnv -> QName -> Nat -> Term -> TCM Term
+-- removeEtaOnProj eta recN 0 (Var i l)                   =
+--   Var i <$> mapM (removeEtaOnProjApp eta recN) l
+-- removeEtaOnProj eta recN 0 (Lam info (Abs i t))        =
+--   Lam info <$> (Abs i <$> (removeEtaOnProj eta recN 0 t))
+-- removeEtaOnProj eta recN 0 (Def n l)                   = do
+--   proj <- isProjection n
+--   if Just recN == (projProper =<< proj)
+--   then
+--     Def n <$> mapM (removeEtaApp eta) l
+--   else
+--     Def n <$> mapM (removeEtaOnProjApp eta recN) l
+-- removeEtaOnProj eta recN 0 (Con hd info l)             =
+--   Con hd info <$> mapM (removeEtaOnProjApp eta recN) l
+-- removeEtaOnProj eta recN 0 (Pi a@Dom{unDom=El sa u} b) = do
+--   dom <- removeEtaOnProj eta recN 0 u
+--   codom <- removeEtaOnProj eta recN 0 (unEl (unAbs b))
+--   return $ Pi a{unDom=El sa dom} b{unAbs=El (_getSort (unAbs b)) codom}
+-- removeEtaOnProj eta recN 0 (Lit l)                     =
+--   return $ Lit l
+-- removeEtaOnProj eta recN 0 (Level l)                   =
+--   return $ Level l
+-- removeEtaOnProj eta recN 0 (Sort s)                    =
+--   return $ Sort s
+-- removeEtaOnProj eta recN j (Pi a b)                    = do
+--   codom <- removeEtaOnProj eta recN (j-1) (unEl (unAbs b))
+--   return $ Pi a b{unAbs=El (_getSort (unAbs b)) codom}
 
-removeEtaOnProjApp :: DkModuleEnv -> QName -> Elim -> TCM Elim
-removeEtaOnProjApp eta recN (Apply (Arg info t)) = Apply <$> (Arg info <$> removeEtaOnProj eta recN 0 t)
+-- removeEtaOnProjApp :: DkModuleEnv -> QName -> Elim -> TCM Elim
+-- removeEtaOnProjApp eta recN (Apply (Arg info t)) = Apply <$> (Arg info <$> removeEtaOnProj eta recN 0 t)
 
-removeEta :: DkModuleEnv -> Term -> TCM Term
-removeEta eta t =
-  case t of
-    Var i l           ->
-      Var i <$> mapM (removeEtaApp eta) l
-    Lam info (Abs i t)->
-      etaContractFun =<< Lam info <$> (Abs i <$> removeEta eta t)
-    Def n l ->
-      if eta == n
-      then
-        case l !! 2 of
-          Apply (Arg _ t) -> removeEta eta t
-      else
-        Def n <$> mapM (removeEtaApp eta) l
-    Con hd info l ->
-      Con hd info <$> mapM (removeEtaApp eta) l
-    Pi a@Dom{unDom=El sa u} b -> do
-      dom <- removeEta eta u
-      codom <- removeEta eta (unEl (unAbs b))
-      return $ Pi a{unDom=El sa dom} b{unAbs=El (_getSort (unAbs b)) codom}
-    Lit l -> return $ Lit l
+-- removeEta :: DkModuleEnv -> Term -> TCM Term
+-- removeEta eta t =
+--   case t of
+--     Var i l           ->
+--       Var i <$> mapM (removeEtaApp eta) l
+--     Lam info (Abs i t)->
+--       etaContractFun =<< Lam info <$> (Abs i <$> removeEta eta t)
+--     Def n l ->
+--       if eta == n
+--       then
+--         case l !! 2 of
+--           Apply (Arg _ t) -> removeEta eta t
+--       else
+--         Def n <$> mapM (removeEtaApp eta) l
+--     Con hd info l ->
+--       Con hd info <$> mapM (removeEtaApp eta) l
+--     Pi a@Dom{unDom=El sa u} b -> do
+--       dom <- removeEta eta u
+--       codom <- removeEta eta (unEl (unAbs b))
+--       return $ Pi a{unDom=El sa dom} b{unAbs=El (_getSort (unAbs b)) codom}
+--     Lit l -> return $ Lit l
 
-removeEtaApp :: DkModuleEnv -> Elim -> TCM Elim
-removeEtaApp eta (Apply (Arg info t)) =
-  Apply <$> (Arg info <$> removeEta eta t)
+-- removeEtaApp :: DkModuleEnv -> Elim -> TCM Elim
+-- removeEtaApp eta (Apply (Arg info t)) =
+--   Apply <$> (Arg info <$> removeEta eta t)
